@@ -7,24 +7,31 @@ Streamlit GUI for the RAG Q&A System
 import streamlit as st
 import os
 import time
+import tempfile
 from pathlib import Path
 import fitz  # PyMuPDF
 from PIL import Image
 import io
 from typing import List, Optional
 from datetime import datetime, timedelta
-from memory.storage import MemoryStorage
 from memory.rolling import RollingMemoryStorage
 
 # Import our existing RAG modules
 from rag_modules.app import SimpleRAGApp
 from rag_modules.utils import pdf_utils
-from memory.generator import generate_merged_memory
+
+# Choose memory generator based on environment variable
+if os.getenv('USE_ENTITY_AWARE_MEMORY', 'false').lower() == 'true':
+    from memory.entity_aware_generator import generate_merged_memory
+    MEMORY_MODE = "Entity-Aware"
+else:
+    from memory.generator import generate_merged_memory
+    MEMORY_MODE = "Standard"
 
 # Page configuration
 st.set_page_config(
-    page_title="RAG Q&A System",
-    page_icon="🤖",
+    page_title="Study Pal - Your Reading Helper",
+    page_icon="📚",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -106,10 +113,32 @@ def init_session_state():
         st.session_state.model_initialized = False
 
     # Memory system state
-    if 'memory_storage' not in st.session_state:
-        st.session_state.memory_storage = MemoryStorage()
     if 'rolling_memory' not in st.session_state:
         st.session_state.rolling_memory = RollingMemoryStorage()
+    
+    # Flag to track if memory has been loaded into the current session
+    if 'memory_loaded' not in st.session_state:
+        st.session_state.memory_loaded = False
+    
+    # Store the loaded memory context
+    if 'memory_context' not in st.session_state:
+        st.session_state.memory_context = None
+
+def load_memory_into_session():
+    """Load memory into the current session (only once per session)"""
+    if not st.session_state.memory_loaded:
+        memory_text = st.session_state.rolling_memory.get_text()
+        if memory_text and memory_text.strip():
+            st.session_state.memory_context = memory_text
+            st.session_state.memory_loaded = True
+            print(f"📖 Memory loaded into session: {len(memory_text)} characters")
+            return True
+        else:
+            st.session_state.memory_context = None
+            st.session_state.memory_loaded = True
+            print("📖 No memory found, starting fresh session")
+            return False
+    return st.session_state.memory_context is not None
 
 def initialize_model():
     """Initialize the RAG model"""
@@ -220,7 +249,7 @@ def summarize_and_store_memory():
 
         st.session_state.rolling_memory.set_text(merged)
         try:
-            save_path = getattr(st.session_state.rolling_memory, 'db_path', None) or "/home/mihoyohb/LLM_project/data/memory.db"
+            save_path = st.session_state.rolling_memory.db_path
             print(f"💾 Saved to: {save_path}")
             # Read-back verification
             read_back = st.session_state.rolling_memory.get_text()
@@ -243,8 +272,8 @@ def main():
     # Header
     st.markdown("""
     <div class="main-header">
-        <h1>🤖 RAG Q&A System</h1>
-        <p>Intelligent Document Q&A System - PDF Preview + AI Chat Assistant</p>
+        <h1>📚 Study Pal</h1>
+        <p>Your Reading Helper - AI-Powered Document Assistant with Personalized Memory</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -255,6 +284,21 @@ def main():
     with st.sidebar:
         st.markdown("### 🧠 Memory (Rolling Text)")
         st.caption("Generate and merge on demand; length limited, auto-summarizes when exceeded")
+        
+        # Display memory mode
+        if MEMORY_MODE == "Entity-Aware":
+            st.info("🔬 Mode: **Entity-Aware** (preserves key terms)")
+        else:
+            st.info("📝 Mode: **Standard**")
+        
+        # Memory status indicator
+        if st.session_state.memory_loaded:
+            if st.session_state.memory_context:
+                st.success(f"✅ Memory loaded ({len(st.session_state.memory_context)} chars)")
+            else:
+                st.info("ℹ️ No memory in current session")
+        else:
+            st.warning("⏳ Memory will load on first question")
 
         max_chars = st.number_input("Memory Length Limit (characters)", min_value=200, max_value=5000, value=1200, step=100)
         st.session_state.rolling_memory.max_chars = max_chars # Update max_chars in session state
@@ -294,27 +338,33 @@ def main():
         )
         
         if uploaded_file is not None:
-            # Save uploaded file temporarily
-            temp_path = f"/tmp/{uploaded_file.name}"
+            # Save uploaded file temporarily (cross-platform)
+            temp_dir = tempfile.gettempdir()
+            temp_path = os.path.join(temp_dir, uploaded_file.name)
             with open(temp_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
             
             # Load PDF into RAG system
             if st.session_state.current_pdf_path != temp_path:
                 with st.spinner("Processing PDF file..."):
+                    # Load memory on first interaction (if not already loaded)
+                    load_memory_into_session()
+                    
                     splits, pdf_path = pdf_utils.load_pdf(temp_path)
                     if splits:
                         st.session_state.rag_app.splits = splits
                         st.session_state.rag_app.current_pdf = pdf_path
                         
-                        # Reinitialize model with new PDF
+                        # Reinitialize model with new PDF and memory context
                         if st.session_state.rag_app.model_type == "google":
                             st.session_state.rag_app.setup_google_model(
-                                st.session_state.rag_app.current_model or "gemini-1.5-flash"
+                                st.session_state.rag_app.current_model or "gemini-1.5-flash",
+                                st.session_state.memory_context
                             )
                         else:
                             st.session_state.rag_app.setup_local_model(
-                                st.session_state.rag_app.current_model or "phi3:mini"
+                                st.session_state.rag_app.current_model or "phi3:mini",
+                                st.session_state.memory_context
                             )
                         
                         load_pdf_preview(temp_path)
@@ -385,7 +435,10 @@ def main():
                 if st.button("🌐 Google Model", disabled=(st.session_state.rag_app.model_type == "google")):
                     if os.getenv("GOOGLE_API_KEY"):
                         with st.spinner("Switching to Google model..."):
-                            success = st.session_state.rag_app.setup_google_model()
+                            # Preserve memory when switching models
+                            success = st.session_state.rag_app.setup_google_model(
+                                memory_context=st.session_state.memory_context
+                            )
                             if success:
                                 st.success("✅ Switched to Google model")
                             else:
@@ -397,7 +450,10 @@ def main():
             with col2:
                 if st.button("🏠 Local Model", disabled=(st.session_state.rag_app.model_type == "local")):
                     with st.spinner("Switching to local model..."):
-                        success = st.session_state.rag_app.setup_local_model()
+                        # Preserve memory when switching models
+                        success = st.session_state.rag_app.setup_local_model(
+                            memory_context=st.session_state.memory_context
+                        )
                         if success:
                             st.success("✅ Switched to local model")
                         else:
@@ -416,7 +472,11 @@ def main():
                     )
                     if st.button("Apply Model"):
                         with st.spinner(f"Switching to {selected_model}..."):
-                            success = st.session_state.rag_app.setup_google_model(selected_model)
+                            # Preserve memory when changing model
+                            success = st.session_state.rag_app.setup_google_model(
+                                selected_model,
+                                memory_context=st.session_state.memory_context
+                            )
                             if success:
                                 st.success(f"✅ Switched to {selected_model}")
                             else:
@@ -433,6 +493,22 @@ def main():
         
         # Chat input
         if prompt := st.chat_input("Enter your question..."):
+            # Load memory on first question (if not already loaded)
+            if not st.session_state.memory_loaded:
+                load_memory_into_session()
+                # If we have memory, we need to reinitialize the RAG chain with memory context
+                if st.session_state.memory_context and st.session_state.rag_app.splits:
+                    if st.session_state.rag_app.model_type == "google":
+                        st.session_state.rag_app.setup_google_model(
+                            st.session_state.rag_app.current_model or "gemini-1.5-flash",
+                            st.session_state.memory_context
+                        )
+                    else:
+                        st.session_state.rag_app.setup_local_model(
+                            st.session_state.rag_app.current_model or "phi3:mini",
+                            st.session_state.memory_context
+                        )
+            
             # Add user message to chat history
             st.session_state.chat_history.append({
                 "role": "user",
@@ -475,8 +551,24 @@ def main():
                             })
                         
                         elif st.session_state.rag_app.llm:
-                            # Chat-only mode
-                            llm_response = st.session_state.rag_app.llm.invoke(prompt)
+                            # Chat-only mode (with optional memory)
+                            # Build prompt with memory if available
+                            if st.session_state.memory_context and st.session_state.memory_context.strip():
+                                chat_prompt = f"""You are a personalized AI assistant. You have the following memory about the user:
+
+<memory>
+{st.session_state.memory_context}
+</memory>
+
+Use this memory to provide personalized responses. Answer the user's question taking into account their background and preferences.
+
+User question: {prompt}
+
+Please answer in a natural, helpful way."""
+                            else:
+                                chat_prompt = prompt
+                            
+                            llm_response = st.session_state.rag_app.llm.invoke(chat_prompt)
                             content = getattr(llm_response, 'content', str(llm_response))
                             
                             st.write(content)
@@ -501,6 +593,36 @@ def main():
         # Clear chat button
         if st.button("🗑️ Clear Chat"):
             st.session_state.chat_history = []
+            st.rerun()
+        
+        # New session button (reset memory loading flag and reinject memory)
+        if st.button("🔄 New Session (Reload Memory)"):
+            # Clear chat history
+            st.session_state.chat_history = []
+            
+            # Reset memory loading flags
+            st.session_state.memory_loaded = False
+            st.session_state.memory_context = None
+            
+            # Immediately load memory for the new session
+            memory_loaded = load_memory_into_session()
+            
+            # Reinitialize model with new memory context (even in chat-only mode)
+            if st.session_state.rag_app.model_type == "google":
+                st.session_state.rag_app.setup_google_model(
+                    st.session_state.rag_app.current_model or "gemini-1.5-flash",
+                    st.session_state.memory_context
+                )
+            elif st.session_state.rag_app.model_type == "local":
+                st.session_state.rag_app.setup_local_model(
+                    st.session_state.rag_app.current_model or "phi3:mini",
+                    st.session_state.memory_context
+                )
+            
+            if memory_loaded:
+                st.success(f"New session started! Memory loaded ({len(st.session_state.memory_context)} chars)")
+            else:
+                st.info("New session started! No memory found.")
             st.rerun()
 
 if __name__ == "__main__":
