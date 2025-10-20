@@ -241,7 +241,7 @@ def summarize_and_store_memory():
                 chat_pairs=pairs,
                 history_text=history_text,
                 max_chars=max_chars,
-                model_name="gemini-2.5-pro-preview-03-25" # Force Gemini for memory generation
+                model_name="gemini-2.5-flash" # Force Gemini for memory generation
             )
         except Exception as gen_err:
             st.error(f"Memory generation failed: {gen_err}")
